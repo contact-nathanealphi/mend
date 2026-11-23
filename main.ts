@@ -641,28 +641,47 @@ function parseJson(text) {
   } catch {
     return fail("invalid patch: not valid JSON");
   }
+  // Unwrap the shapes a JSON tool call can take: a bare list, an object
+  // with edits/tool_calls/calls/operations, a single call, an OpenAI-style
+  // call with arguments (string or object), or an Anthropic-style call
+  // with an input object.
+  const unwrap = (obj) => {
+    if (!obj || typeof obj !== "object") return obj;
+    if (typeof obj.arguments === "string") {
+      try {
+        return unwrap(JSON.parse(obj.arguments));
+      } catch {
+        return obj;
+      }
+    }
+    if (obj.arguments && typeof obj.arguments === "object") return unwrap(obj.arguments);
+    if (obj.input && typeof obj.input === "object") return unwrap(obj.input);
+    return obj;
+  };
   let list = null;
   let file = null;
   if (Array.isArray(data)) {
     list = data;
   } else if (data && typeof data === "object") {
-    if (Array.isArray(data.edits)) {
-      list = data.edits;
+    const arr = data.edits || data.tool_calls || data.calls || data.operations;
+    if (Array.isArray(arr)) {
+      list = arr;
       file = data.file || data.path || null;
     } else if (data.file || data.path) {
       list = [data];
-    } else if (data.tool && (data.old_text !== undefined || data.old !== undefined)) {
+    } else if (data.tool || data.name || data.function) {
       list = [data];
     }
   }
   if (!list) return fail("invalid patch: JSON has no edits");
   const edits = [];
-  for (const item of list) {
+  for (let item of list) {
+    item = unwrap(item);
     if (!item || typeof item !== "object") return fail("invalid patch: bad JSON edit");
-    const f = item.file || item.path || file;
+    const f = item.file || item.path || item.filepath || file;
     if (!f || typeof f !== "string") return fail("invalid patch: JSON edit without a file");
-    const oldText = item.old_text ?? item.old ?? item.search ?? item.search_text;
-    const newText = item.new_text ?? item.new ?? item.replace ?? item.replace_text;
+    const oldText = item.old_text ?? item.old_str ?? item.old_string ?? item.old ?? item.search ?? item.search_text;
+    const newText = item.new_text ?? item.new_str ?? item.new_string ?? item.new ?? item.replace ?? item.replace_text;
     if (typeof oldText !== "string" || typeof newText !== "string") {
       return fail("invalid patch: JSON edit without old/new text");
     }
