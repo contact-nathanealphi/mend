@@ -24,7 +24,7 @@
 // Written in erasable TypeScript so Node 22 runs it with type stripping.
 
 import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, statSync, chmodSync } from "node:fs";
-import { dirname, resolve, relative, sep } from "node:path";
+import { dirname, resolve } from "node:path";
 
 export const VERSION = "1.0.0";
 
@@ -329,6 +329,7 @@ function parseUnified(text) {
       if (j < lines.length && lines[j].startsWith("+++ ")) {
         newPath = stripABPrefix(headerPath(lines[j]));
         const file = newPath !== null ? newPath : oldPath;
+        if (file === null) return fail("invalid patch: ---/+++ without a file");
         cur = newFileEdit(file);
         cur.create = oldPath === null || isNew || pendingNew;
         cur.remove = newPath === null || isDel || pendingDel;
@@ -475,7 +476,7 @@ function parseSearchReplace(text) {
   let pendingPath = null;
   while (i < lines.length) {
     const line = lines[i];
-    if (line === "<<<<<<< SEARCH") {
+    if (line.trim() === "<<<<<<< SEARCH") {
       sawAny = true;
       if (!pendingPath) return fail("invalid patch: SEARCH/REPLACE block without a file");
       const cur = newFileEdit(pendingPath);
@@ -483,14 +484,14 @@ function parseSearchReplace(text) {
       pendingPath = null;
       const oldLines = [];
       i++;
-      while (i < lines.length && lines[i] !== "=======") {
+      while (i < lines.length && lines[i].trim() !== "=======") {
         oldLines.push(lines[i]);
         i++;
       }
       if (i >= lines.length) return fail("invalid patch: SEARCH block without =======");
       i++; // skip =======
       const newLines = [];
-      while (i < lines.length && lines[i] !== ">>>>>>> REPLACE") {
+      while (i < lines.length && lines[i].trim() !== ">>>>>>> REPLACE") {
         newLines.push(lines[i]);
         i++;
       }
@@ -699,19 +700,15 @@ function parseJson(text) {
 // --- Format detection ------------------------------------------------------
 
 function looksLikeV4a(text) {
-  return (
-    text.includes("*** Begin Patch") ||
-    text.includes("*** Update File:") ||
-    text.includes("*** Add File:") ||
-    text.includes("*** Delete File:") ||
-    text.includes("*** Move to:")
-  );
+  // Markers must start a line: a patch that ADDS a line containing one
+  // (e.g. "+*** Begin Patch") is not a V4A patch.
+  return /(^|\n)\*\*\* (Begin Patch|Update File:|Add File:|Delete File:|Move to:)/.test(text);
 }
 
 function detectFormat(text) {
   const t = text.trimStart();
   if (t.startsWith("{") || t.startsWith("[")) return "json";
-  if (t.includes("<<<<<<< SEARCH")) return "search_replace";
+  if (/(^|\n)<<<<<<< SEARCH/.test(text)) return "search_replace";
   if (looksLikeV4a(text)) return "v4a";
   if (t.startsWith("diff --git ") || t.startsWith("--- ")) return "unified";
   return null;
@@ -746,6 +743,9 @@ function applyEdits(edits, maxTier) {
   const state = new Map(); // file -> { exists, deleted, raw, crlf }
   for (const edit of edits) {
     if (!pathIsSafe(edit.file)) return fail(`invalid patch: unsafe path ${edit.file}`);
+    if (edit.renameFrom && !existsSync(resolve(edit.renameFrom))) {
+      return fail(`file not found: ${edit.renameFrom}`);
+    }
     let st = state.get(edit.file);
     if (!st) {
       const abs = resolve(edit.file);
