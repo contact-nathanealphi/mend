@@ -111,6 +111,33 @@ function findBlock(haystack, needle, tier) {
   return { index: found };
 }
 
+// First match of needle in haystack at or after `from`, at one tier.
+function findBlockFrom(haystack, needle, tier, from) {
+  if (needle.length === 0) return null;
+  const norm = tier === 0 ? (s) => s : tier === 1 ? normTier1 : normTier2;
+  const nNeedle = needle.map(norm);
+  if (nNeedle.every((l) => l === "")) return null;
+  outer: for (let i = from; i + needle.length <= haystack.length; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (norm(haystack[i + j]) !== nNeedle[j]) continue outer;
+    }
+    return i;
+  }
+  return null;
+}
+
+// The anchor line: the first line at or after `from` that starts with the
+// anchor text, at one tier.
+function findAnchorLine(haystack, anchor, tier, from) {
+  const norm = tier === 0 ? (s) => s : tier === 1 ? normTier1 : normTier2;
+  const nAnchor = norm(anchor);
+  if (nAnchor === "") return null;
+  for (let i = from; i < haystack.length; i++) {
+    if (norm(haystack[i]).startsWith(nAnchor)) return i;
+  }
+  return null;
+}
+
 // Try tiers in order; the first tier with a unique match wins.
 function findAtFirstTier(haystack, needle, maxTier) {
   for (let tier = 0; tier <= maxTier; tier++) {
@@ -315,8 +342,14 @@ function parseUnified(text) {
         pendingNew = false;
         pendingDel = false;
       }
-      const m = /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/.exec(line);
+      const m = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(line);
       if (!m) return fail("invalid patch: bad hunk header");
+      // The hunk's line counts say where it ends: without them a following
+      // "--- <file>" header looks like a removed line. Counts may be
+      // wrong (models drift them), so after the counts run out, hunk lines
+      // keep being consumed until a header line appears.
+      let oldNeed = m[2] === undefined ? 1 : parseInt(m[2], 10);
+      let newNeed = m[4] === undefined ? 1 : parseInt(m[4], 10);
       const oldLines = [];
       const newLines = [];
       // "\ No newline at end of file" describes the line just read: after
@@ -324,26 +357,57 @@ function parseUnified(text) {
       // - line the OLD file did, and the new file ends WITH one.
       let lastKind = null;
       let markerKind = null;
+      let trailingContext = 0;
       i++;
+      const isHeaderLine = (l) =>
+        l.startsWith("@@ ") || l.startsWith("diff --git ") || l.startsWith("--- ") || l.startsWith("+++ ");
       let hunkDone = false;
       while (i < lines.length && !hunkDone) {
         const hl = lines[i];
+        if (oldNeed <= 0 && newNeed <= 0) {
+          // Counts are spent: only keep consuming clear hunk lines, and
+          // stop at anything that could be a header. A "\ No newline"
+          // marker still belongs to this hunk.
+          if (hl.startsWith("\\")) {
+            markerKind = lastKind;
+            i++;
+            continue;
+          }
+          if (isHeaderLine(hl)) {
+            hunkDone = true;
+            continue;
+          }
+          if (!(hl.startsWith(" ") || hl === "" || hl.startsWith("-") || hl.startsWith("+"))) {
+            hunkDone = true;
+            continue;
+          }
+        } else if (isHeaderLine(hl)) {
+          hunkDone = true;
+          continue;
+        }
         if (hl.startsWith(" ") || hl === "") {
           const content = hl.startsWith(" ") ? hl.slice(1) : "";
           oldLines.push(content);
           newLines.push(content);
           lastKind = "context";
           markerKind = null;
+          trailingContext++;
+          oldNeed--;
+          newNeed--;
           i++;
         } else if (hl.startsWith("-")) {
           oldLines.push(hl.slice(1));
           lastKind = "minus";
           markerKind = null;
+          trailingContext = 0;
+          oldNeed--;
           i++;
         } else if (hl.startsWith("+")) {
           newLines.push(hl.slice(1));
           lastKind = "plus";
           markerKind = null;
+          trailingContext = 0;
+          newNeed--;
           i++;
         } else if (hl.startsWith("\\")) {
           markerKind = lastKind;
@@ -357,6 +421,7 @@ function parseUnified(text) {
         newLines,
         noTrailingNewline: markerKind === "plus" || markerKind === "context",
         endsWithNewline: markerKind === "minus",
+        trailingContext,
       });
       continue;
     }
@@ -426,17 +491,122 @@ function parseSearchReplace(text) {
   return { ok: true, edits };
 }
 
-// --- V4A -------------------------------------------------------------------
-// The V4A shape is defined by SPEC.md; this parser is a placeholder that
-// recognises the format's marker and otherwise reports it as unsupported
-// until SPEC.md lands.
+// --- V4A (Codex apply_patch) ------------------------------------------------
+//   *** Begin Patch
+//   *** Add File: <path>        (+ lines only: the new file's content)
+//   *** Delete File: <path>
+//   *** Update File: <path>     (optional "*** Move to: <new>" after it)
+//   *** <path>                  (bare header: an update)
+//   @@ [anchor]                 (hunk; the anchor text names the line the
+//                                hunk starts at or just after)
+//    <context>  -<old>  +<new>   (hunk lines, space/-/+, as in a unified diff)
+//   *** End of File             (following hunks apply at the file's end)
+//   *** End Patch
+// A hunk's old block is matched from the anchor line downwards, first match
+// wins per tier; hunks run top to bottom, so each hunk searches from where
+// the previous one ended.
 
-function looksLikeV4a(text) {
-  return text.includes("V4A") || /^@@@ /m.test(text);
-}
-
-function parseV4a(_text) {
-  return fail("invalid patch: V4A parsing needs SPEC.md");
+function parseV4a(text) {
+  const { lines } = splitLines(text);
+  const edits = [];
+  let cur = null;
+  let i = 0;
+  let sawAny = false;
+  let atEof = false;
+  const finishFile = () => {
+    cur = null;
+    atEof = false;
+  };
+  while (i < lines.length) {
+    const line = lines[i];
+    if (line === "*** Begin Patch" || line === "*** End Patch") {
+      sawAny = true;
+      i++;
+      continue;
+    }
+    if (line === "*** End of File") {
+      sawAny = true;
+      atEof = true;
+      i++;
+      continue;
+    }
+    let m = /^\*\*\* (Add|Update|Delete) File: (.+)$/.exec(line);
+    if (m) {
+      sawAny = true;
+      finishFile();
+      cur = newFileEdit(m[2].trim());
+      if (m[1] === "Add") cur.create = true;
+      if (m[1] === "Delete") cur.remove = true;
+      edits.push(cur);
+      i++;
+      continue;
+    }
+    m = /^\*\*\* Move to: (.+)$/.exec(line);
+    if (m) {
+      sawAny = true;
+      if (!cur || cur.remove || cur.create) return fail("invalid patch: *** Move to: without an update");
+      cur.moveTo = m[1].trim();
+      i++;
+      continue;
+    }
+    m = /^\*\*\* (.+)$/.exec(line);
+    if (m && !m[1].startsWith("Begin") && !m[1].startsWith("End")) {
+      // Bare "*** <path>" header: an update of that file.
+      sawAny = true;
+      finishFile();
+      cur = newFileEdit(m[1].trim());
+      edits.push(cur);
+      i++;
+      continue;
+    }
+    if (line.startsWith("@@")) {
+      sawAny = true;
+      if (!cur) return fail("invalid patch: V4A hunk without a file");
+      const anchor = line.slice(2).replace(/^ /, "");
+      const oldLines = [];
+      const newLines = [];
+      let trailingContext = 0;
+      i++;
+      while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("***")) {
+        const hl = lines[i];
+        if (hl.startsWith(" ") || hl === "") {
+          const content = hl.startsWith(" ") ? hl.slice(1) : "";
+          oldLines.push(content);
+          newLines.push(content);
+          trailingContext++;
+        } else if (hl.startsWith("-")) {
+          oldLines.push(hl.slice(1));
+          trailingContext = 0;
+        } else if (hl.startsWith("+")) {
+          newLines.push(hl.slice(1));
+          trailingContext = 0;
+        } else {
+          return fail("invalid patch: bad line in V4A hunk");
+        }
+        i++;
+      }
+      cur.hunks.push({ oldLines, newLines, anchor, atEof, trailingContext });
+      continue;
+    }
+    if (line.startsWith("+") && cur && cur.create) {
+      // Add-file content without an @@ hunk: bare + lines.
+      sawAny = true;
+      const newLines = [];
+      while (i < lines.length && lines[i].startsWith("+")) {
+        newLines.push(lines[i].slice(1));
+        i++;
+      }
+      cur.hunks.push({ oldLines: [], newLines });
+      continue;
+    }
+    if (line.trim() === "") {
+      i++;
+      continue;
+    }
+    return fail("invalid patch: unexpected line in V4A patch");
+  }
+  if (!sawAny) return fail("invalid patch: not a V4A patch");
+  return { ok: true, edits };
 }
 
 // --- JSON edits ------------------------------------------------------------
@@ -491,12 +661,22 @@ function parseJson(text) {
 
 // --- Format detection ------------------------------------------------------
 
+function looksLikeV4a(text) {
+  return (
+    text.includes("*** Begin Patch") ||
+    text.includes("*** Update File:") ||
+    text.includes("*** Add File:") ||
+    text.includes("*** Delete File:") ||
+    text.includes("*** Move to:")
+  );
+}
+
 function detectFormat(text) {
   const t = text.trimStart();
   if (t.startsWith("{") || t.startsWith("[")) return "json";
   if (t.includes("<<<<<<< SEARCH")) return "search_replace";
-  if (t.startsWith("diff --git ") || t.startsWith("--- ") || /^@@ /m.test(t)) return "unified";
   if (looksLikeV4a(text)) return "v4a";
+  if (t.startsWith("diff --git ") || t.startsWith("--- ")) return "unified";
   return null;
 }
 
@@ -536,6 +716,11 @@ function applyEdits(edits, maxTier) {
       st = { exists, deleted: false, raw: exists ? readFileSync(abs, "utf8") : null, crlf: false };
       if (exists) st.crlf = st.raw.includes("\r\n");
       state.set(edit.file, st);
+    }
+    if (edit.moveTo) {
+      if (!pathIsSafe(edit.moveTo)) return fail(`invalid patch: unsafe path ${edit.moveTo}`);
+      if (existsSync(resolve(edit.moveTo))) return fail(`file already exists: ${edit.moveTo}`);
+      st.moveTo = edit.moveTo;
     }
     const abs = resolve(edit.file);
     if (edit.remove) {
@@ -592,8 +777,79 @@ function applyEdits(edits, maxTier) {
         endsNL = sp.endsWithNewline;
         continue;
       }
-      if (hunk.oldLines.length === 0) {
+      if (hunk.oldLines.length === 0 && hunk.anchor === undefined) {
         return fail(`invalid patch: empty search in ${edit.file}`);
+      }
+      if (hunk.anchor !== undefined) {
+        // V4A hunk: anchor-aware, top-to-bottom. The cursor is where the
+        // previous hunk of this file ended.
+        if (st.cursor === undefined) st.cursor = 0;
+        let regionStart = st.cursor;
+        if (hunk.atEof) {
+          regionStart = cur.length;
+        } else if (hunk.anchor !== "") {
+          let anchorAt = null;
+          for (let tier = 0; tier <= maxTier; tier++) {
+            anchorAt = findAnchorLine(cur, hunk.anchor, tier, st.cursor);
+            if (anchorAt !== null) break;
+          }
+          if (anchorAt === null) return fail(`no match in ${edit.file}`);
+          regionStart = anchorAt;
+        }
+        if (hunk.oldLines.length === 0) {
+          const insertPos = hunk.atEof ? cur.length : hunk.anchor !== "" ? regionStart + 1 : regionStart;
+          let replacement = hunk.newLines;
+          if (regionStart < cur.length) {
+            replacement = reindent(replacement, [], cur.slice(regionStart, regionStart + 1));
+          }
+          cur = cur.slice(0, insertPos).concat(replacement, cur.slice(insertPos));
+          st.cursor = insertPos + replacement.length;
+          continue;
+        }
+        if (hunk.atEof) {
+          // The block must be the file's tail.
+          const start = cur.length - hunk.oldLines.length;
+          if (start < 0) return fail(`no match in ${edit.file}`);
+          let matchedTier = -1;
+          for (let tier = 0; tier <= maxTier; tier++) {
+            if (findBlockFrom(cur, hunk.oldLines, tier, start) === start) {
+              matchedTier = tier;
+              break;
+            }
+          }
+          if (matchedTier === -1) return fail(`no match in ${edit.file}`);
+          let replacement = hunk.newLines;
+          if (matchedTier > 0) {
+            replacement = reindent(replacement, hunk.oldLines, cur.slice(start, start + hunk.oldLines.length));
+          }
+          cur = cur.slice(0, start).concat(replacement);
+          if (hunk.noTrailingNewline) endsNL = false;
+          else if (hunk.endsWithNewline) endsNL = true;
+          st.cursor = cur.length;
+          continue;
+        }
+        let pos = null;
+        let posTier = 0;
+        for (let tier = 0; tier <= maxTier; tier++) {
+          pos = findBlockFrom(cur, hunk.oldLines, tier, regionStart);
+          if (pos !== null) {
+            posTier = tier;
+            break;
+          }
+        }
+        if (pos === null) return fail(`no match in ${edit.file}`);
+        const atEnd = pos + hunk.oldLines.length === cur.length;
+        let replacement = hunk.newLines;
+        if (posTier > 0) {
+          replacement = reindent(replacement, hunk.oldLines, cur.slice(pos, pos + hunk.oldLines.length));
+        }
+        cur = cur.slice(0, pos).concat(replacement, cur.slice(pos + hunk.oldLines.length));
+        if (atEnd) {
+          if (hunk.noTrailingNewline) endsNL = false;
+          else if (hunk.endsWithNewline) endsNL = true;
+        }
+        st.cursor = pos + replacement.length - (hunk.trailingContext || 0);
+        continue;
       }
       const found = findAtFirstTier(cur, hunk.oldLines, maxTier);
       if (!found) return fail(`no match in ${edit.file}`);
@@ -614,6 +870,12 @@ function applyEdits(edits, maxTier) {
   for (const [file, st] of state) {
     const abs = resolve(file);
     const original = existsSync(abs) ? readFileSync(abs, "utf8") : null;
+    if (st.moveTo && st.exists && !st.deleted) {
+      plan.push({ file: st.moveTo, action: "write", content: st.raw });
+      if (original !== null) plan.push({ file, action: "delete", content: null });
+      changed.push(st.moveTo);
+      continue;
+    }
     if (st.deleted) {
       if (original !== null) {
         plan.push({ file, action: "delete", content: null });
@@ -657,7 +919,20 @@ function main(argv) {
   let strict = false;
   let dryRun = false;
   let patchPath = null;
+  let noMoreOptions = false;
   for (const arg of argv) {
+    if (noMoreOptions) {
+      if (patchPath === null) patchPath = arg;
+      else {
+        process.stdout.write("error: too many arguments\n");
+        return 1;
+      }
+      continue;
+    }
+    if (arg === "--") {
+      noMoreOptions = true;
+      continue;
+    }
     if (arg === "--strict") strict = true;
     else if (arg === "--dry-run") dryRun = true;
     else if (arg === "--help" || arg === "-h") {
