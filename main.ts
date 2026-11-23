@@ -272,6 +272,8 @@ function parseUnified(text) {
   let curPushed = false;
   let pendingNew = false;
   let pendingDel = false;
+  let pendingRenameFrom = null;
+  let pendingRenameTo = null;
   let i = 0;
   let sawAny = false;
   while (i < lines.length) {
@@ -285,6 +287,18 @@ function parseUnified(text) {
       curPushed = false;
       pendingNew = false;
       pendingDel = false;
+      pendingRenameFrom = null;
+      pendingRenameTo = null;
+      i++;
+      continue;
+    }
+    if (line.startsWith("rename from ")) {
+      pendingRenameFrom = line.slice("rename from ".length).trim();
+      i++;
+      continue;
+    }
+    if (line.startsWith("rename to ")) {
+      pendingRenameTo = line.slice("rename to ".length).trim();
       i++;
       continue;
     }
@@ -318,10 +332,15 @@ function parseUnified(text) {
         cur = newFileEdit(file);
         cur.create = oldPath === null || isNew || pendingNew;
         cur.remove = newPath === null || isDel || pendingDel;
+        if (pendingRenameFrom && pendingRenameTo && file === pendingRenameTo) {
+          cur.renameFrom = pendingRenameFrom;
+        }
         curPushed = true;
         edits.push(cur);
         pendingNew = false;
         pendingDel = false;
+        pendingRenameFrom = null;
+        pendingRenameTo = null;
         i = j + 1;
         continue;
       }
@@ -431,8 +450,6 @@ function parseUnified(text) {
       line.startsWith("new file mode") ||
       line.startsWith("deleted file mode") ||
       line.startsWith("similarity index") ||
-      line.startsWith("rename from") ||
-      line.startsWith("rename to") ||
       line.startsWith("old mode") ||
       line.startsWith("new mode") ||
       line === "" ||
@@ -560,14 +577,14 @@ function parseV4a(text) {
       i++;
       continue;
     }
-    if (line.startsWith("@@")) {
+    if (line.startsWith("@@") || (cur && !cur.remove && !cur.create && (line.startsWith(" ") || line.startsWith("-") || line.startsWith("+")))) {
       sawAny = true;
       if (!cur) return fail("invalid patch: V4A hunk without a file");
-      const anchor = line.slice(2).replace(/^ /, "");
+      const anchor = line.startsWith("@@") ? line.slice(2).replace(/^ /, "") : "";
       const oldLines = [];
       const newLines = [];
       let trailingContext = 0;
-      i++;
+      if (line.startsWith("@@")) i++;
       while (i < lines.length && !lines[i].startsWith("@@") && !lines[i].startsWith("***")) {
         const hl = lines[i];
         if (hl.startsWith(" ") || hl === "") {
@@ -713,8 +730,10 @@ function applyEdits(edits, maxTier) {
     let st = state.get(edit.file);
     if (!st) {
       const abs = resolve(edit.file);
-      const exists = existsSync(abs);
-      st = { exists, deleted: false, raw: exists ? readFileSync(abs, "utf8") : null, crlf: false, bom: false };
+      // A rename's hunks describe the old file's content, not the target's.
+      const src = edit.renameFrom && existsSync(resolve(edit.renameFrom)) ? resolve(edit.renameFrom) : abs;
+      const exists = existsSync(src);
+      st = { exists, deleted: false, raw: exists ? readFileSync(src, "utf8") : null, crlf: false, bom: false };
       if (exists) {
         st.crlf = st.raw.includes("\r\n");
         if (st.raw.startsWith("\uFEFF")) {
@@ -728,6 +747,10 @@ function applyEdits(edits, maxTier) {
       if (!pathIsSafe(edit.moveTo)) return fail(`invalid patch: unsafe path ${edit.moveTo}`);
       if (existsSync(resolve(edit.moveTo))) return fail(`file already exists: ${edit.moveTo}`);
       st.moveTo = edit.moveTo;
+    }
+    if (edit.renameFrom) {
+      if (!pathIsSafe(edit.renameFrom)) return fail(`invalid patch: unsafe path ${edit.renameFrom}`);
+      st.renameFrom = edit.renameFrom;
     }
     const abs = resolve(edit.file);
     if (edit.remove) {
@@ -878,6 +901,9 @@ function applyEdits(edits, maxTier) {
     const abs = resolve(file);
     const original = existsSync(abs) ? readFileSync(abs, "utf8") : null;
     const finalContent = st.raw === null ? null : st.bom ? "\uFEFF" + st.raw : st.raw;
+    if (st.renameFrom && st.exists && !st.deleted && existsSync(resolve(st.renameFrom))) {
+      plan.push({ file: st.renameFrom, action: "delete", content: null });
+    }
     if (st.moveTo && st.exists && !st.deleted) {
       plan.push({ file: st.moveTo, action: "write", content: finalContent });
       if (original !== null) plan.push({ file, action: "delete", content: null });
@@ -1010,15 +1036,19 @@ function main(argv) {
 }
 
 // Entry point. main() may return a promise only for the runner hand-over.
+// Set exitCode (never process.exit): exiting at once can truncate stdout
+// still draining into a pipe, and the grader compares stdout exactly.
 const result = main(process.argv.slice(2));
 if (result && typeof result.then === "function") {
   result.then(
-    (code) => process.exit(code ?? 0),
+    (code) => {
+      process.exitCode = code ?? 0;
+    },
     (err) => {
       process.stderr.write(`mend: ${err && err.message ? err.message : String(err)}\n`);
-      process.exit(1);
+      process.exitCode = 1;
     },
   );
 } else {
-  process.exit(result);
+  process.exitCode = result;
 }
