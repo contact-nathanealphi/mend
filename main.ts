@@ -23,7 +23,7 @@
 // Node 22, standard library only. Deterministic: no times, no randomness.
 // Written in erasable TypeScript so Node 22 runs it with type stripping.
 
-import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, unlinkSync, mkdirSync, statSync, chmodSync } from "node:fs";
 import { dirname, resolve, relative, sep } from "node:path";
 
 export const VERSION = "1.0.0";
@@ -242,6 +242,7 @@ function reindent(newLines, oldLines, foundLines) {
 // ---------------------------------------------------------------------------
 
 function newFileEdit(file) {
+  if (file.startsWith("./")) file = file.slice(2);
   return { file, create: false, remove: false, hunks: [] };
 }
 
@@ -713,8 +714,14 @@ function applyEdits(edits, maxTier) {
     if (!st) {
       const abs = resolve(edit.file);
       const exists = existsSync(abs);
-      st = { exists, deleted: false, raw: exists ? readFileSync(abs, "utf8") : null, crlf: false };
-      if (exists) st.crlf = st.raw.includes("\r\n");
+      st = { exists, deleted: false, raw: exists ? readFileSync(abs, "utf8") : null, crlf: false, bom: false };
+      if (exists) {
+        st.crlf = st.raw.includes("\r\n");
+        if (st.raw.startsWith("\uFEFF")) {
+          st.bom = true;
+          st.raw = st.raw.slice(1);
+        }
+      }
       state.set(edit.file, st);
     }
     if (edit.moveTo) {
@@ -870,8 +877,9 @@ function applyEdits(edits, maxTier) {
   for (const [file, st] of state) {
     const abs = resolve(file);
     const original = existsSync(abs) ? readFileSync(abs, "utf8") : null;
+    const finalContent = st.raw === null ? null : st.bom ? "\uFEFF" + st.raw : st.raw;
     if (st.moveTo && st.exists && !st.deleted) {
-      plan.push({ file: st.moveTo, action: "write", content: st.raw });
+      plan.push({ file: st.moveTo, action: "write", content: finalContent });
       if (original !== null) plan.push({ file, action: "delete", content: null });
       changed.push(st.moveTo);
       continue;
@@ -881,8 +889,8 @@ function applyEdits(edits, maxTier) {
         plan.push({ file, action: "delete", content: null });
         changed.push(file);
       }
-    } else if (st.exists && st.raw !== original) {
-      plan.push({ file, action: "write", content: st.raw });
+    } else if (st.exists && finalContent !== original) {
+      plan.push({ file, action: "write", content: finalContent });
       changed.push(file);
     }
   }
@@ -897,7 +905,9 @@ function commitPlan(plan) {
     } else {
       const dir = dirname(abs);
       mkdirSync(dir, { recursive: true });
+      const mode = existsSync(abs) ? statSync(abs).mode : undefined;
       writeFileSync(abs, step.content, "utf8");
+      if (mode !== undefined) chmodSync(abs, mode);
     }
   }
 }
@@ -953,31 +963,46 @@ function main(argv) {
   }
 
   let patchText;
-  if (patchPath !== null) {
-    if (!existsSync(patchPath)) {
-      process.stdout.write(`error: cannot read patch file: ${patchPath}\n`);
-      return 1;
+  try {
+    if (patchPath !== null) {
+      patchText = readFileSync(patchPath, "utf8");
+    } else {
+      patchText = readStdinSync();
     }
-    patchText = readFileSync(patchPath, "utf8");
-  } else {
-    patchText = readStdinSync();
+  } catch {
+    process.stdout.write(`error: cannot read patch file: ${patchPath ?? "-"}\n`);
+    return 1;
   }
   if (patchText.trim() === "") {
     process.stdout.write("error: invalid patch: empty patch\n");
     return 1;
   }
 
+  if (patchText.startsWith("\uFEFF")) patchText = patchText.slice(1);
   const parsed = parsePatch(patchText);
   if (!parsed.ok) {
     process.stdout.write(`error: ${parsed.message}\n`);
     return 1;
   }
-  const applied = applyEdits(parsed.edits, strict ? 0 : 2);
+  let applied;
+  try {
+    applied = applyEdits(parsed.edits, strict ? 0 : 2);
+  } catch (err) {
+    process.stdout.write(`error: ${err && err.message ? err.message : String(err)}\n`);
+    return 1;
+  }
   if (!applied.ok) {
     process.stdout.write(`error: ${applied.message}\n`);
     return 1;
   }
-  if (!dryRun) commitPlan(applied.plan);
+  if (!dryRun) {
+    try {
+      commitPlan(applied.plan);
+    } catch (err) {
+      process.stdout.write(`error: ${err && err.message ? err.message : String(err)}\n`);
+      return 1;
+    }
+  }
   for (const file of applied.changed) {
     process.stdout.write(`patched ${file}\n`);
   }
