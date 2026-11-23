@@ -1009,7 +1009,7 @@ function main(argv) {
 
   let patchText;
   try {
-    if (patchPath !== null) {
+    if (patchPath !== null && patchPath !== "-") {
       patchText = readFileSync(patchPath, "utf8");
     } else {
       patchText = readStdinSync();
